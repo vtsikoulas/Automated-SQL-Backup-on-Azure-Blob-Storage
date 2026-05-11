@@ -1,37 +1,67 @@
--- Tsikoulas Vasilis For Entersoftone 2026-05 - vtsikoulas@impact.gr
--- Automated Azure Blob Storage backup script with striping for databases > 195GB
--- Max stripe size: 195 GB (Azure block blob limit)
--- Max stripes: 64 (SQL Server limit)
--- Uncomment line 140 to enable automatic execution of generated backup commands.
--- File naming format: ServerName_DatabaseName_Date_Time.bak
+-- =============================================================================
+-- Τίτλος    : Αυτοματοποιημένο Backup SQL Server σε Azure Blob Storage με Striping
+-- Συγγραφέας : Τσικούλας Βασίλης (vtsikoulas@impact.gr) | Entersoftone
+-- Ημερομηνία : 2026-05
+-- =============================================================================
+-- Περιγραφή:
+--   Δημιουργεί αυτόματα εντολές FULL backup για όλες τις online βάσεις
+--   δεδομένων απευθείας σε Azure Blob Storage. Υπολογίζει δυναμικά τον
+--   αριθμό stripes βάσει μεγέθους, τηρώντας τα όρια Azure και SQL Server.
+--
+-- Απαιτήσεις:
+--   - SQL Server 2016 (v13) ή νεότερη
+--   - Azure Blob Storage credential με SAS token (βλ. Βήμα 1 παρακάτω)
+--   - Δικαιώματα BACKUP DATABASE
+--
+-- Μορφή ονόματος αρχείου : ServerName_DatabaseName_YYYY-MM-DD_HHmmss[_N].bak
+-- Μέγιστο μέγεθος stripe : 195 GB (όριο Azure block blob)
+-- Μέγιστος αριθμός stripes: 64 (όριο SQL Server)
+--
+-- Για αυτόματη εκτέλεση των εντολών backup (αντί απλής εκτύπωσης),
+-- αφαιρέστε το σχόλιο από τη γραμμή EXEC(@SQL) μέσα στον cursor loop.
+-- =============================================================================
 
 
--- Uncomment and run once Δημιουργία Credential για το Azure Blob Storage, με όνομα το URL του container και τύπο ταυτοποίησης Shared Access Signature (SAS) και το κλειδί που δημιουργήσαμε στο Azure Portal.
+-- =============================================================================
+-- ΒΗΜΑ 1: Δημιουργία Credential Azure Blob Storage (ΜΟΝΟ ΜΙΑ ΦΟΡΑ)
+-- =============================================================================
+-- Αντικαταστήστε τα παρακάτω placeholders με τα δικά σας στοιχεία και
+-- αφαιρέστε τα σχόλια για να εκτελέσετε τις εντολές.
+-- Το SAS token πρέπει να ξεκινά με 'sp=...' (χωρίς το αρχικό '?').
 --USE [master]
 --GO
---CREATE CREDENTIAL [https://vtsikoulasstorage2.blob.core.windows.net/dtabasebackups] WITH IDENTITY = N'Shared Access Signature', SECRET = N'123'  --Χωρίς το "?" πρέπει να ξεκινάει με "sp=..." 
+--CREATE CREDENTIAL [https://YOUR_STORAGE_ACCOUNT.blob.core.windows.net/YOUR_CONTAINER]
+--    WITH IDENTITY = N'Shared Access Signature',
+--    SECRET = N'sp=...'   -- Εισάγετε εδώ το SAS token σας
 --GO
 
 
 
--- Check SQL Server version (Backup to URL with block blobs requires SQL Server 2016+)
+-- =============================================================================
+-- Έλεγχος έκδοσης SQL Server (απαιτείται 2016+ για block blob και striping)
+-- =============================================================================
 IF CAST(SERVERPROPERTY('ProductMajorVersion') AS INT) < 13
 BEGIN
-    PRINT N'** ERROR: SQL Server version ' + CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(50)) 
-        + N' detected. Backup to URL with block blobs and striping requires SQL Server 2016 (v13) or later. **';
-    PRINT N'** Script execution aborted. **';
+    PRINT N'** ΣΦΑΛΜΑ: Εντοπίστηκε SQL Server ' + CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(50))
+        + N'. Το backup σε URL με block blobs και striping απαιτεί SQL Server 2016 (v13) ή νεότερη. **';
+    PRINT N'** Η εκτέλεση του script ακυρώθηκε. **';
     RETURN;
 END
 
-DECLARE @BaseURL NVARCHAR(500) = N'https://vtsikoulasstorage2.blob.core.windows.net/dtabasebackups'; 
-DECLARE @ServerName NVARCHAR(128) = CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128));
-DECLARE @DateSuffix NVARCHAR(50) = FORMAT(GETDATE(), 'yyyy-MM-dd_HHmmss');
-DECLARE @MaxStripeSizeGB INT = 195;
-DECLARE @MaxStripes INT = 64;
-DECLARE @MaxTransferSize INT = 4194304;
-DECLARE @BlockSize INT = 65536;
+-- =============================================================================
+-- Παράμετροι ρύθμισης — τροποποιήστε πριν την εκτέλεση
+-- =============================================================================
+DECLARE @BaseURL         NVARCHAR(500) = N'https://YOUR_STORAGE_ACCOUNT.blob.core.windows.net/YOUR_CONTAINER';
+DECLARE @ServerName      NVARCHAR(128) = CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128));
+DECLARE @DateSuffix      NVARCHAR(50)  = FORMAT(GETDATE(), 'yyyy-MM-dd_HHmmss');
+DECLARE @MaxStripeSizeGB INT           = 195;     -- Όριο Azure block blob σε GB
+DECLARE @MaxStripes      INT           = 64;      -- Μέγιστος αριθμός stripes (SQL Server)
+DECLARE @MaxTransferSize INT           = 4194304; -- 4 MB — βελτιστοποίηση δικτυακής μεταφοράς
+DECLARE @BlockSize       INT           = 65536;   -- 64 KB — βελτιστοποίηση I/O
 
--- Gather database info
+-- =============================================================================
+-- Συλλογή πληροφοριών βάσεων δεδομένων
+-- =============================================================================
 SELECT 
     d.name AS DatabaseName,
     CAST(SUM(mf.size) * 8.0 / 1024 / 1024 AS DECIMAL(10,2)) AS SizeGB,
@@ -49,28 +79,31 @@ SELECT
 INTO #DBInfo
 FROM sys.databases d
 JOIN sys.master_files mf ON d.database_id = mf.database_id
-WHERE d.name NOT IN ('tempdb', 'model')
-  AND d.state = 0 -- ONLINE only
+WHERE d.name NOT IN ('tempdb', 'model')  -- Εξαίρεση system databases
+  AND d.state = 0                         -- Μόνο ONLINE βάσεις
 GROUP BY d.name, d.recovery_model_desc;
 
--- Display database info
+-- Εμφάνιση αποτελεσμάτων (βάσεις, μεγέθη, αριθμός stripes)
 SELECT * FROM #DBInfo ORDER BY SizeGB DESC;
 
--- Warn about max backup size limit
+-- Έλεγχος για βάσεις που υπερβαίνουν το μέγιστο υποστηριζόμενο μέγεθος backup
 IF EXISTS (SELECT 1 FROM #DBInfo WHERE SizeGB > (@MaxStripeSizeGB * @MaxStripes))
 BEGIN
-    PRINT N'** ERROR: One or more databases exceed the maximum backup size of ' 
-        + CAST(@MaxStripeSizeGB * @MaxStripes AS NVARCHAR(20)) + N' GB (195 GB x 64 stripes). These cannot be backed up to Azure Blob Storage with this method. **';
+    PRINT N'** ΣΦΑΛΜΑ: Μία ή περισσότερες βάσεις υπερβαίνουν το μέγιστο μέγεθος backup των '
+        + CAST(@MaxStripeSizeGB * @MaxStripes AS NVARCHAR(20))
+        + N' GB (195 GB x 64 stripes) και δεν μπορούν να γίνουν backup με αυτή τη μέθοδο. **';
     PRINT N'';
 END
 
--- Generate backup commands (largest to smallest)
-DECLARE @DBName NVARCHAR(256);
-DECLARE @SizeGB DECIMAL(10,2);
-DECLARE @Stripes INT;
+-- =============================================================================
+-- Δυναμική δημιουργία εντολών backup (από μεγαλύτερη σε μικρότερη βάση)
+-- =============================================================================
+DECLARE @DBName        NVARCHAR(256);
+DECLARE @SizeGB        DECIMAL(10,2);
+DECLARE @Stripes       INT;
 DECLARE @RecoveryModel NVARCHAR(60);
-DECLARE @SQL NVARCHAR(MAX);
-DECLARE @i INT;
+DECLARE @SQL           NVARCHAR(MAX);
+DECLARE @i             INT;
 
 DECLARE db_cursor CURSOR FOR
     SELECT DatabaseName, SizeGB, NumberOfStripes, RecoveryModel 
@@ -82,14 +115,14 @@ FETCH NEXT FROM db_cursor INTO @DBName, @SizeGB, @Stripes, @RecoveryModel;
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    -- Warning for FULL recovery model
+    -- Προειδοποίηση για βάσεις σε FULL recovery model (απαιτείται και transaction log backup)
     IF @RecoveryModel = N'FULL'
     BEGIN
-        PRINT N'-- ** WARNING: DB [' + @DBName + N'] is in FULL recovery model. '
-            + N'Please check your backup strategy and your RPO. **';
+        PRINT N'-- ** ΠΡΟΣΟΧΗ: Η βάση [' + @DBName + N'] βρίσκεται σε FULL recovery model. '
+            + N'Βεβαιωθείτε ότι εκτελείτε και transaction log backups. **';
     END
 
-    PRINT N'-- Database: ' + @DBName + N' | Size: ' + CAST(@SizeGB AS NVARCHAR(20)) 
+    PRINT N'-- Βάση: ' + @DBName + N' | Μέγεθος: ' + CAST(@SizeGB AS NVARCHAR(20))
         + N' GB | Stripes: ' + CAST(@Stripes AS NVARCHAR(10))
         + N' | Recovery: ' + @RecoveryModel;
 
@@ -97,11 +130,13 @@ BEGIN
 
     IF @Stripes = 1
     BEGIN
-        SET @SQL = @SQL + N'URL = N''' + @BaseURL + N'/' 
+        -- Ένα μόνο αρχείο backup (βάση ≤ 195 GB)
+        SET @SQL = @SQL + N'URL = N''' + @BaseURL + N'/'
             + @ServerName + N'_' + @DBName + N'_' + @DateSuffix + N'.bak''' + CHAR(13) + CHAR(10);
     END
     ELSE
     BEGIN
+        -- Πολλαπλά αρχεία backup / striping (βάση > 195 GB)
         SET @i = 1;
         WHILE @i <= @Stripes
         BEGIN
@@ -126,7 +161,7 @@ BEGIN
     PRINT N'GO';
     PRINT N'';
 
-    -- Uncomment to execute automatically:
+    -- Αφαιρέστε το σχόλιο στην επόμενη γραμμή για αυτόματη εκτέλεση του backup:
     -- EXEC(@SQL);
 
     FETCH NEXT FROM db_cursor INTO @DBName, @SizeGB, @Stripes, @RecoveryModel;
