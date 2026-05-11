@@ -1,4 +1,4 @@
-# Αυτοματοποιημένο Backup σε Azure Blob Storage με Striping
+# Αυτοματοποιημένο SQL Backup σε Azure Blob Storage με Striping
 
 ## Επισκόπηση
 Αυτό το T-SQL script αυτοματοποιεί τη δημιουργία full backup για όλες τις online βάσεις δεδομένων σε Azure Blob Storage.
