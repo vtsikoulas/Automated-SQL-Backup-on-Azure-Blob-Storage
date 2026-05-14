@@ -35,7 +35,7 @@
 Επαληθεύει ότι ο SQL Server είναι 2016+ για υποστήριξη block blob και striping.
 
 ### 2. Ανακάλυψη Βάσεων Δεδομένων
-- Ερωτά τα `sys.databases` και `sys.master_files`
+- Ρωτά `sys.databases` και `sys.master_files`
 - Υπολογίζει το πραγματικό μέγεθος σε GB
 - Εξαιρεί tempdb, model και offline βάσεις
 - Καταγράφει το recovery model για προειδοποιήσεις
